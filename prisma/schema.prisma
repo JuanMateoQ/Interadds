@@ -1,0 +1,266 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =========================================================
+// ENUMS DEL SISTEMA (RS-38, RNF-22)
+// =========================================================
+
+enum Role {
+  CLIENTE
+  PROVEEDOR
+  ADMIN_SISTEMA
+}
+
+enum ServiceStatus {
+  BORRADOR
+  PUBLICADO
+  PAUSADO
+}
+
+// Los 7 estados estrictos del contrato en el Happy Path (RNF-22)
+enum ContractStatus {
+  GENERADO
+  FIRMADO_POR_UNA_PARTE
+  VIGENTE
+  ANTICIPO_PAGADO
+  CONTENIDO_ENTREGADO
+  CONTENIDO_APROBADO
+  COMPLETADO
+}
+
+enum CertificateStatus {
+  ACTIVO
+  REVOCADO
+}
+
+enum EvidenceType {
+  ORIGEN     // RS-16 (FCO_NRO.2)
+  RECEPCION  // RS-17 (FCO_NRR.2)
+}
+
+enum PaymentInstallment {
+  ANTICIPO   // Primer 50% (Paso 2.4)
+  SALDO      // Segundo 50% (Paso 3.4)
+}
+
+enum PaymentStatus {
+  PENDIENTE
+  ORDEN_CREADA
+  CAPTURADO
+  FALLIDO
+}
+
+enum DeliverableStatus {
+  SUBIDO
+  APROBADO
+}
+
+// =========================================================
+// MÓDULO 1: AUTENTICACIÓN (Dueño: Sebas Ramos)
+// =========================================================
+
+model User {
+  id                  String              @id @default(uuid())
+  email               String              @unique
+  name                String
+  passwordHash        String              // RS-12: Hash bcrypt
+  role                Role                @default(CLIENTE) // RS-41: Por defecto CLIENTE
+  isActive            Boolean             @default(true)
+  failedLoginAttempts Int                 @default(0)
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+
+  providerProfile     ProviderProfile?
+  passwordResetTokens PasswordResetToken[]
+  services            MarketingService[]
+  clientContracts     Contract[]          @relation("ClientContracts")
+  providerContracts   Contract[]          @relation("ProviderContracts")
+  certificates        Certificate[]
+  signatures          SignatureEvidence[]
+  chatMessages        ChatMessage[]
+}
+
+model ProviderProfile {
+  id             String   @id @default(uuid())
+  userId         String   @unique
+  businessName   String
+  description    String
+  contactInfo    String
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model PasswordResetToken {
+  id        String   @id @default(uuid())
+  token     String   @unique // RS-03, RS-07, RS-15
+  userId    String
+  used      Boolean  @default(false)
+  expiresAt DateTime // RS-42
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// =========================================================
+// MÓDULO 2: CONTRATOS Y CATÁLOGO (Dueña: Danna Morales)
+// =========================================================
+
+model Category {
+  id       String             @id @default(uuid())
+  name     String             @unique
+  services MarketingService[]
+}
+
+model MarketingService {
+  id           String        @id @default(uuid())
+  title        String
+  categoryId   String
+  description  String
+  price        Decimal       @db.Decimal(10, 2)
+  deliveryDays Int
+  status       ServiceStatus @default(PUBLICADO)
+  providerId   String
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  category     Category      @relation(fields: [categoryId], references: [id])
+  provider     User          @relation(fields: [providerId], references: [id])
+  contracts    Contract[]
+
+  @@index([title])
+  @@index([categoryId])
+  @@index([price])
+}
+
+model Contract {
+  id              String              @id @default(uuid())
+  serviceId       String
+  clientId        String
+  providerId      String
+  templateVersion String              @default("v1.0") // RNF-21
+  contractText    String              @db.Text         // Inmutable tras crearse
+  totalPrice      Decimal             @db.Decimal(10, 2)
+  advanceAmount   Decimal             @db.Decimal(10, 2) // 50% anticipo
+  balanceAmount   Decimal             @db.Decimal(10, 2) // 50% saldo
+  sha256Hash      String              // RF-14, RS-20: Hash SHA-256 fijo del texto
+  status          ContractStatus      @default(GENERADO)
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  service         MarketingService    @relation(fields: [serviceId], references: [id])
+  client          User                @relation("ClientContracts", fields: [clientId], references: [id])
+  provider        User                @relation("ProviderContracts", fields: [providerId], references: [id])
+  evidences       SignatureEvidence[]
+  payments        Payment[]
+  chatRoom        ChatRoom?
+  deliverables    Deliverable[]
+
+  @@index([clientId])
+  @@index([providerId])
+  @@index([status])
+}
+
+// =========================================================
+// MÓDULO 3: FIRMA DIGITAL Y CA (Dueña: Domenica Cardenas)
+// =========================================================
+
+model Certificate {
+  id           String              @id @default(uuid())
+  serialNumber String              @unique
+  userId       String
+  publicKeyPem String              @db.Text
+  issuerName   String              @default("Interadds Issuing CA")
+  issuedAt     DateTime            @default(now())
+  expiresAt    DateTime            // RS-42: Vigencia de 1 año
+  status       CertificateStatus   @default(ACTIVO)
+
+  user         User                @relation(fields: [userId], references: [id])
+  evidences    SignatureEvidence[]
+}
+
+model SignatureEvidence {
+  id            String       @id @default(uuid())
+  contractId    String
+  signerId      String
+  certificateId String?
+  eventStep     String       // FIRMA_CLIENTE, FIRMA_PROVEEDOR, PAGO_ANTICIPO, ENTREGA_CONTENIDO, APROBACION_CONTENIDO, PAGO_SALDO
+  evidenceType  EvidenceType // ORIGEN (RS-16) o RECEPCION (RS-17)
+  signedHash    String
+  signatureB64  String       @db.Text
+  nonce         String       @unique
+  timestampUtc  DateTime     @default(now())
+
+  contract      Contract     @relation(fields: [contractId], references: [id])
+  signer        User         @relation(fields: [signerId], references: [id])
+  certificate   Certificate? @relation(fields: [certificateId], references: [id])
+}
+
+// =========================================================
+// MÓDULO 4: PAGOS (Dueño: Mateo Quisilema)
+// =========================================================
+
+model Payment {
+  id              String             @id @default(uuid())
+  contractId      String
+  installment     PaymentInstallment
+  amount          Decimal            @db.Decimal(10, 2)
+  currency        String             @default("USD")
+  status          PaymentStatus      @default(PENDIENTE)
+  idempotencyKey  String             @unique // RNF-22: Referencia propia única
+  paypalOrderId   String?            @unique
+  paypalCaptureId String?            @unique
+  paymentNonce    String?            @unique
+  receiptJson     Json?              // RF-21, RF-28: Comprobante con ID de captura
+  paidAt          DateTime?
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  contract        Contract           @relation(fields: [contractId], references: [id])
+
+  @@unique([contractId, installment])
+  @@index([contractId])
+}
+
+// =========================================================
+// MÓDULO 5: CHAT Y ENTREGA (Dueña: Salma Morales)
+// =========================================================
+
+model ChatRoom {
+  id         String        @id @default(uuid())
+  contractId String?       @unique // null = Sala General (RF-25), con valor = Sala del Contrato (RF-23)
+  isGeneral  Boolean       @default(false)
+  createdAt  DateTime      @default(now())
+
+  contract   Contract?     @relation(fields: [contractId], references: [id])
+  messages   ChatMessage[]
+}
+
+model ChatMessage {
+  id        String   @id @default(uuid())
+  roomId    String
+  authorId  String
+  text      String   @db.Text
+  createdAt DateTime @default(now())
+
+  room      ChatRoom @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  author    User     @relation(fields: [authorId], references: [id])
+}
+
+model Deliverable {
+  id         String            @id @default(uuid())
+  contractId String
+  filePath   String
+  mimeType   String
+  sizeBytes  Int
+  fileSha256 String            // RS-16: Hash del archivo entregado
+  version    Int               @default(1)
+  status     DeliverableStatus @default(SUBIDO)
+  createdAt  DateTime          @default(now())
+  approvedAt DateTime?
+
+  contract   Contract          @relation(fields: [contractId], references: [id])
+}
